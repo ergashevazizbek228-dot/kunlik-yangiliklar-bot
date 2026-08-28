@@ -54,6 +54,10 @@ MIN_WORDS_IN_POST = 35
 MAX_REWRITE_ATTEMPTS = 2  # birinchi urinish + 1 marta qayta yozish
 
 
+# ------------------------------------------------------------------
+# Yordamchi: fayl bilan ishlash
+# ------------------------------------------------------------------
+
 def check_env():
     missing = [
         name for name, val in [
@@ -88,6 +92,10 @@ def make_id(entry):
     key = entry.get("link") or entry.get("id") or entry.get("title", "")
     return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
+
+# ------------------------------------------------------------------
+# Groq (matnni qayta yozish + sifat nazorati)
+# ------------------------------------------------------------------
 
 def call_groq(prompt, max_tokens=400, temperature=0.4):
     try:
@@ -129,6 +137,7 @@ def rewrite_with_ai(title, summary, source_name, extra_feedback=None):
 
 
 def quality_check(post_text, source_title):
+    """Postni AI orqali sifat nazoratidan o'tkazadi."""
     if not post_text or len(post_text.split()) < MIN_WORDS_IN_POST:
         return False, "Post juda qisqa yoki bo'sh"
 
@@ -152,6 +161,7 @@ def quality_check(post_text, source_title):
 
 
 def get_quality_checked_post(title, summary, source_name):
+    """Post yozadi va sifat nazoratidan o'tkazadi, kerak bo'lsa qayta yozadi."""
     feedback = None
     for attempt in range(1, MAX_REWRITE_ATTEMPTS + 1):
         text = rewrite_with_ai(title, summary, source_name, extra_feedback=feedback)
@@ -162,3 +172,213 @@ def get_quality_checked_post(title, summary, source_name):
             return text
         print(f"  Sifat nazoratidan o'tmadi (urinish {attempt}): {reason}")
         feedback = f"Oldingi urinish rad etildi: {reason}. Buni tuzatib qayta yoz."
+    return None
+
+
+# ------------------------------------------------------------------
+# Rasm topish / generatsiya qilish
+# ------------------------------------------------------------------
+
+def extract_image_from_entry(entry):
+    """RSS xabarining o'zidan rasm havolasini topishga harakat qiladi."""
+    try:
+        if getattr(entry, "media_content", None):
+            url = entry.media_content[0].get("url")
+            if url:
+                return url
+        if getattr(entry, "media_thumbnail", None):
+            url = entry.media_thumbnail[0].get("url")
+            if url:
+                return url
+        for link in entry.get("links", []):
+            if str(link.get("type", "")).startswith("image"):
+                return link.get("href")
+    except Exception:
+        pass
+    return None
+
+
+def extract_og_image(article_url):
+    """Maqola sahifasidan og:image meta-tegini o'qiydi."""
+    if not article_url:
+        return None
+    try:
+        resp = requests.get(
+            article_url, timeout=10,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; NewsBot/1.0)"},
+            allow_redirects=True,
+        )
+        match = re.search(
+            r'<meta[^>]+(?:property|name)=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+            resp.text, re.IGNORECASE,
+        )
+        if match:
+            return match.group(1)
+    except Exception:
+        pass
+    return None
+
+
+def generate_image_ai(title, post_text):
+    """Gemini 2.5 Flash Image (Nano Banana) orqali post uchun rasm yaratadi."""
+    image_prompt = (
+        "Create a realistic, editorial-style photograph illustrating the concept of the "
+        "following news topic. No text, letters, or watermarks in the image. "
+        "Do not depict any real, identifiable named person — use symbolic, conceptual, "
+        "or generic imagery instead (objects, locations, abstract representations). "
+        "Professional, neutral news-photography style.\n\n"
+        f"Topic: {title}\n{post_text[:300]}"
+    )
+    try:
+        resp = requests.post(
+            f"{GEMINI_IMAGE_URL}?key={GEMINI_API_KEY}",
+            json={"contents": [{"parts": [{"text": image_prompt}]}]},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        parts = data["candidates"][0]["content"]["parts"]
+        for part in parts:
+            inline = part.get("inlineData") or part.get("inline_data")
+            if inline and inline.get("data"):
+                return base64.b64decode(inline["data"])
+    except Exception as e:
+        print(f"  Rasm generatsiya xatoligi: {e}")
+    return None
+
+
+# ------------------------------------------------------------------
+# Telegram'ga joylash
+# ------------------------------------------------------------------
+
+def build_caption(text, link):
+    caption = f"{text}\n\n🔗 Manba: {link}"
+    if len(caption) > 1024:
+        cut = 1024 - len(f"...\n\n🔗 Manba: {link}") - 3
+        caption = f"{text[:max(cut, 0)]}...\n\n🔗 Manba: {link}"
+        caption = caption[:1024]
+    return caption
+
+
+def post_photo_url(image_url, caption):
+    resp = requests.post(
+        TELEGRAM_SEND_PHOTO,
+        data={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "photo": image_url,
+            "caption": caption,
+            "parse_mode": "HTML",
+        },
+        timeout=30,
+    )
+    return resp.status_code == 200, resp.text
+
+
+def post_photo_bytes(image_bytes, caption):
+    resp = requests.post(
+        TELEGRAM_SEND_PHOTO,
+        data={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "caption": caption,
+            "parse_mode": "HTML",
+        },
+        files={"photo": ("news.png", image_bytes, "image/png")},
+        timeout=60,
+    )
+    return resp.status_code == 200, resp.text
+
+
+def post_text_only(caption):
+    resp = requests.post(
+        TELEGRAM_SEND_MESSAGE,
+        json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": caption,
+            "parse_mode": "HTML",
+        },
+        timeout=20,
+    )
+    return resp.status_code == 200, resp.text
+
+
+def publish_post(title, text, link, entry):
+    """Rasm bilan (yoki bo'lmasa AI generatsiya qilingan rasm bilan) postni joylaydi."""
+    caption = build_caption(text, link)
+
+    # 1) Manbadagi haqiqiy rasmni sinab ko'ramiz
+    image_url = extract_image_from_entry(entry) or extract_og_image(link)
+    if image_url:
+        ok, info = post_photo_url(image_url, caption)
+        if ok:
+            return True
+        print(f"  Manba rasmi ishlamadi ({info[:120]}), AI bilan rasm yaratamiz...")
+
+    # 2) AI orqali rasm generatsiya qilamiz (Nano Banana / Gemini)
+    image_bytes = generate_image_ai(title, text)
+    if image_bytes:
+        ok, info = post_photo_bytes(image_bytes, caption)
+        if ok:
+            return True
+        print(f"  Generatsiya qilingan rasmni yuborib bo'lmadi: {info[:120]}")
+
+    # 3) Oxirgi chora — faqat matn bilan yuboramiz
+    print("  Rasmsiz, faqat matn bilan yuborilmoqda.")
+    ok, info = post_text_only(caption)
+    if not ok:
+        print(f"  Matnli post ham yuborilmadi: {info[:120]}")
+    return ok
+
+
+# ------------------------------------------------------------------
+# Asosiy jarayon
+# ------------------------------------------------------------------
+
+def main():
+    check_env()
+    posted_ids = load_posted_ids()
+    new_posts_count = 0
+
+    for source_name, feed_url in SOURCES:
+        if new_posts_count >= MAX_POSTS_PER_RUN:
+            break
+
+        print(f"Tekshirilmoqda: {source_name}")
+        try:
+            feed = feedparser.parse(feed_url)
+        except Exception as e:
+            print(f"  Feed o'qishda xatolik: {e}")
+            continue
+
+        entries = feed.entries[:ENTRIES_PER_SOURCE]
+
+        for entry in entries:
+            if new_posts_count >= MAX_POSTS_PER_RUN:
+                break
+
+            entry_id = make_id(entry)
+            if entry_id in posted_ids:
+                continue
+
+            title = entry.get("title", "")
+            summary = entry.get("summary", "") or entry.get("description", "")
+            link = entry.get("link", "")
+
+            post_text = get_quality_checked_post(title, summary, source_name)
+            if not post_text:
+                print(f"  O'tkazib yuborildi (sifat nazoratidan o'tmadi): {title[:60]}")
+                posted_ids.add(entry_id)  # qayta-qayta urinib o'tirmaslik uchun
+                continue
+
+            success = publish_post(title, post_text, link, entry)
+            if success:
+                print(f"  Joylandi: {title[:60]}")
+                posted_ids.add(entry_id)
+                new_posts_count += 1
+                time.sleep(3)  # Telegram flood-limitdan saqlanish
+
+    save_posted_ids(posted_ids)
+    print(f"Tugadi. Jami yangi post: {new_posts_count}")
+
+
+if __name__ == "__main__":
+    main()
