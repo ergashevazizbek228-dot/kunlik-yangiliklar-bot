@@ -39,7 +39,12 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MODELS = [
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "llama3-70b-8192",
+    "llama3-8b-8192",
+]
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 GEMINI_IMAGE_MODEL = "gemini-2.5-flash-image"
@@ -98,27 +103,35 @@ def make_id(entry):
 # ------------------------------------------------------------------
 
 def call_groq(prompt, max_tokens=400, temperature=0.4):
-    try:
-        resp = requests.post(
-            GROQ_URL,
-            headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": GROQ_MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-            },
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return data["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        print(f"Groq xatoligi: {e}")
-        return None
+    last_error = None
+    for model in GROQ_MODELS:
+        try:
+            resp = requests.post(
+                GROQ_URL,
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                },
+                timeout=30,
+            )
+            if resp.status_code != 200:
+                last_error = f"model={model} status={resp.status_code} body={resp.text[:300]}"
+                print(f"Groq xatoligi ({model}): {resp.status_code} - {resp.text[:300]}")
+                continue
+            data = resp.json()
+            return data["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            last_error = f"model={model} exception={e}"
+            print(f"Groq istisnosi ({model}): {e}")
+            continue
+    print(f"Barcha Groq modellari ishlamadi. Oxirgi xatolik: {last_error}")
+    return None
 
 
 def rewrite_with_ai(title, summary, source_name, extra_feedback=None):
